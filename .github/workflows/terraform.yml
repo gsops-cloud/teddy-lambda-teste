@@ -1,0 +1,318 @@
+name: Terraform CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'terraform/**'
+      - 'lambda/**'
+      - '.github/workflows/terraform.yml'
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches:
+      - main
+      - master
+    paths:
+      - 'terraform/**'
+      - 'lambda/**'
+      - '.github/workflows/terraform.yml'
+  workflow_dispatch:
+    inputs:
+      terraform_action:
+        description: 'Ação do Terraform'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  TF_VERSION: '1.6.0'
+  AWS_REGION: 'us-east-1'
+  TF_STATE_BUCKET: ${{ secrets.TERRAFORM_STATE_BUCKET }}
+  TF_STATE_KEY: 'terraform.tfstate'
+  TF_STATE_DYNAMODB_TABLE: ${{ secrets.TERRAFORM_STATE_DYNAMODB_TABLE }}
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: |
+          if [ -n "$TF_STATE_BUCKET" ]; then
+            # Cria arquivo de backend config temporário
+            {
+              echo 'terraform {'
+              echo '  backend "s3" {'
+              echo "    bucket = \"$TF_STATE_BUCKET\""
+              echo "    key    = \"$TF_STATE_KEY\""
+              echo "    region = \"$AWS_REGION\""
+              [ -n "$TF_STATE_DYNAMODB_TABLE" ] && echo "    dynamodb_table = \"$TF_STATE_DYNAMODB_TABLE\""
+              echo '    encrypt = true'
+              echo '  }'
+              echo '}'
+            } > backend.tf
+          fi
+          terraform init
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        if: github.event_name == 'pull_request' && github.event.action != 'closed'
+        run: terraform plan -no-color -out=tfplan
+        continue-on-error: true
+
+      - name: Comment PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request' && github.event.action != 'closed'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.tf_actions_working_dir }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Import Resources Before Destroy (PR Closed)
+        if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == false
+        continue-on-error: true
+        env:
+          PROJECT_NAME: teddy
+          TABLE_NAME: teddy-timestamps
+        run: |
+          # Importa recursos antes de destruir para garantir que o estado está sincronizado
+          REGION="${{ env.AWS_REGION }}"
+          
+          # Verifica se há recursos no estado
+          STATE_COUNT=$(terraform state list 2>/dev/null | wc -l || echo "0")
+          if [ "$STATE_COUNT" -eq 0 ]; then
+            echo "Estado vazio ou não encontrado, importando recursos existentes..."
+            
+            # Importa DynamoDB table se existir
+            if aws dynamodb describe-table --table-name "$TABLE_NAME" --region "$REGION" > /dev/null 2>&1; then
+              terraform import aws_dynamodb_table.timestamps "$TABLE_NAME" || true
+            fi
+            
+            # Importa IAM Role se existir
+            if aws iam get-role --role-name "${PROJECT_NAME}-lambda-role" > /dev/null 2>&1; then
+              terraform import aws_iam_role.lambda_role "${PROJECT_NAME}-lambda-role" || true
+            fi
+            
+            # Importa SQS Queue se existir
+            QUEUE_URL=$(aws sqs get-queue-url --queue-name "${PROJECT_NAME}-lambda-dlq" --region "$REGION" --query 'QueueUrl' --output text 2>/dev/null || echo "")
+            if [ -n "$QUEUE_URL" ]; then
+              terraform import aws_sqs_queue.lambda_dlq "$QUEUE_URL" || true
+            fi
+            
+            # Importa Lambda Function se existir
+            if aws lambda get-function --function-name "${PROJECT_NAME}-timestamp-writer" --region "$REGION" > /dev/null 2>&1; then
+              terraform import aws_lambda_function.timestamp_writer "${PROJECT_NAME}-timestamp-writer" || true
+            fi
+            
+            # Importa Event Rule se existir
+            if aws events describe-rule --name "${PROJECT_NAME}-every-5-min" --region "$REGION" > /dev/null 2>&1; then
+              terraform import aws_cloudwatch_event_rule.every_5_minutes "${PROJECT_NAME}-every-5-min" || true
+            fi
+            
+            # Importa outros recursos relacionados
+            terraform import aws_lambda_permission.allow_eventbridge "${PROJECT_NAME}-timestamp-writer/AllowExecutionFromEventBridge" 2>/dev/null || true
+            terraform import aws_cloudwatch_event_target.target_lambda "${PROJECT_NAME}-every-5-min/TimestampWriter" 2>/dev/null || true
+            terraform import aws_lambda_function_event_invoke_config.timestamp_writer "${PROJECT_NAME}-timestamp-writer" 2>/dev/null || true
+            terraform import aws_iam_role_policy.lambda_policy "${PROJECT_NAME}-lambda-role:${PROJECT_NAME}-lambda-policy" 2>/dev/null || true
+          else
+            echo "Estado já contém $STATE_COUNT recursos. Prosseguindo com destroy..."
+          fi
+
+      - name: Terraform Destroy (PR Closed)
+        if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == false
+        run: terraform destroy -auto-approve
+
+      - name: Import Existing Resources (if needed)
+        if: |
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+          (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.terraform_action == 'apply'))
+        continue-on-error: true
+        env:
+          PROJECT_NAME: teddy
+          TABLE_NAME: teddy-timestamps
+        run: |
+          # Tenta importar recursos que podem já existir
+          # Isso evita erros de "já existe" na primeira execução
+          REGION="${{ env.AWS_REGION }}"
+          
+          # Importa DynamoDB table se existir
+          if aws dynamodb describe-table --table-name "$TABLE_NAME" --region "$REGION" > /dev/null 2>&1; then
+            echo "Importing DynamoDB table: $TABLE_NAME"
+            terraform import aws_dynamodb_table.timestamps "$TABLE_NAME" || true
+          fi
+          
+          # Importa IAM Role se existir
+          if aws iam get-role --role-name "${PROJECT_NAME}-lambda-role" > /dev/null 2>&1; then
+            echo "Importing IAM Role: ${PROJECT_NAME}-lambda-role"
+            terraform import aws_iam_role.lambda_role "${PROJECT_NAME}-lambda-role" || true
+          fi
+          
+          # Importa SQS Queue se existir
+          QUEUE_URL=$(aws sqs get-queue-url --queue-name "${PROJECT_NAME}-lambda-dlq" --region "$REGION" --query 'QueueUrl' --output text 2>/dev/null || echo "")
+          if [ -n "$QUEUE_URL" ]; then
+            echo "Importing SQS Queue: $QUEUE_URL"
+            terraform import aws_sqs_queue.lambda_dlq "$QUEUE_URL" || true
+          fi
+          
+          # Importa Lambda Function se existir
+          if aws lambda get-function --function-name "${PROJECT_NAME}-timestamp-writer" --region "$REGION" > /dev/null 2>&1; then
+            echo "Importing Lambda Function: ${PROJECT_NAME}-timestamp-writer"
+            terraform import aws_lambda_function.timestamp_writer "${PROJECT_NAME}-timestamp-writer" || true
+          fi
+          
+          # Importa Event Rule se existir
+          if aws events describe-rule --name "${PROJECT_NAME}-every-5-min" --region "$REGION" > /dev/null 2>&1; then
+            echo "Importing Event Rule: ${PROJECT_NAME}-every-5-min"
+            terraform import aws_cloudwatch_event_rule.every_5_minutes "${PROJECT_NAME}-every-5-min" || true
+          fi
+          
+          # Importa Lambda Permission se existir
+          # Tenta importar diretamente - se não existir, o || true ignora o erro
+          echo "Attempting to import Lambda Permission: ${PROJECT_NAME}-timestamp-writer/AllowExecutionFromEventBridge"
+          terraform import aws_lambda_permission.allow_eventbridge "${PROJECT_NAME}-timestamp-writer/AllowExecutionFromEventBridge" 2>/dev/null || true
+          
+          # Importa Event Target se existir
+          TARGETS=$(aws events list-targets-by-rule --rule "${PROJECT_NAME}-every-5-min" --region "$REGION" --query 'Targets[?Id==`TimestampWriter`]' --output json 2>/dev/null || echo "[]")
+          if [ "$TARGETS" != "[]" ] && [ -n "$TARGETS" ]; then
+            echo "Importing Event Target: ${PROJECT_NAME}-every-5-min/TimestampWriter"
+            terraform import aws_cloudwatch_event_target.target_lambda "${PROJECT_NAME}-every-5-min/TimestampWriter" || true
+          fi
+          
+          # Importa Lambda Event Invoke Config se existir
+          if aws lambda get-function-event-invoke-config --function-name "${PROJECT_NAME}-timestamp-writer" --region "$REGION" > /dev/null 2>&1; then
+            echo "Importing Lambda Event Invoke Config: ${PROJECT_NAME}-timestamp-writer"
+            terraform import aws_lambda_function_event_invoke_config.timestamp_writer "${PROJECT_NAME}-timestamp-writer" || true
+          fi
+          
+          # Importa IAM Role Policy se existir
+          if aws iam get-role-policy --role-name "${PROJECT_NAME}-lambda-role" --policy-name "${PROJECT_NAME}-lambda-policy" > /dev/null 2>&1; then
+            echo "Importing IAM Role Policy: ${PROJECT_NAME}-lambda-role:${PROJECT_NAME}-lambda-policy"
+            terraform import aws_iam_role_policy.lambda_policy "${PROJECT_NAME}-lambda-role:${PROJECT_NAME}-lambda-policy" || true
+          fi
+
+      - name: Terraform Apply
+        if: |
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+          (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.terraform_action == 'apply'))
+        run: terraform apply -auto-approve
+
+      - name: Import Resources Before Destroy (Manual)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.terraform_action == 'destroy'
+        continue-on-error: true
+        env:
+          PROJECT_NAME: teddy
+          TABLE_NAME: teddy-timestamps
+        run: |
+          # Importa recursos antes de destruir para garantir que o estado está sincronizado
+          REGION="${{ env.AWS_REGION }}"
+          
+          # Verifica se há recursos no estado
+          STATE_COUNT=$(terraform state list 2>/dev/null | wc -l || echo "0")
+          if [ "$STATE_COUNT" -eq 0 ]; then
+            echo "Estado vazio ou não encontrado, importando recursos existentes antes de destruir..."
+            
+            # Importa DynamoDB table se existir
+            if aws dynamodb describe-table --table-name "$TABLE_NAME" --region "$REGION" > /dev/null 2>&1; then
+              echo "Importing DynamoDB table: $TABLE_NAME"
+              terraform import aws_dynamodb_table.timestamps "$TABLE_NAME" || true
+            fi
+            
+            # Importa IAM Role se existir
+            if aws iam get-role --role-name "${PROJECT_NAME}-lambda-role" > /dev/null 2>&1; then
+              echo "Importing IAM Role: ${PROJECT_NAME}-lambda-role"
+              terraform import aws_iam_role.lambda_role "${PROJECT_NAME}-lambda-role" || true
+            fi
+            
+            # Importa SQS Queue se existir
+            QUEUE_URL=$(aws sqs get-queue-url --queue-name "${PROJECT_NAME}-lambda-dlq" --region "$REGION" --query 'QueueUrl' --output text 2>/dev/null || echo "")
+            if [ -n "$QUEUE_URL" ]; then
+              echo "Importing SQS Queue: $QUEUE_URL"
+              terraform import aws_sqs_queue.lambda_dlq "$QUEUE_URL" || true
+            fi
+            
+            # Importa Lambda Function se existir
+            if aws lambda get-function --function-name "${PROJECT_NAME}-timestamp-writer" --region "$REGION" > /dev/null 2>&1; then
+              echo "Importing Lambda Function: ${PROJECT_NAME}-timestamp-writer"
+              terraform import aws_lambda_function.timestamp_writer "${PROJECT_NAME}-timestamp-writer" || true
+            fi
+            
+            # Importa Event Rule se existir
+            if aws events describe-rule --name "${PROJECT_NAME}-every-5-min" --region "$REGION" > /dev/null 2>&1; then
+              echo "Importing Event Rule: ${PROJECT_NAME}-every-5-min"
+              terraform import aws_cloudwatch_event_rule.every_5_minutes "${PROJECT_NAME}-every-5-min" || true
+            fi
+            
+            # Importa outros recursos relacionados
+            echo "Importing related resources..."
+            terraform import aws_lambda_permission.allow_eventbridge "${PROJECT_NAME}-timestamp-writer/AllowExecutionFromEventBridge" 2>/dev/null || true
+            terraform import aws_cloudwatch_event_target.target_lambda "${PROJECT_NAME}-every-5-min/TimestampWriter" 2>/dev/null || true
+            terraform import aws_lambda_function_event_invoke_config.timestamp_writer "${PROJECT_NAME}-timestamp-writer" 2>/dev/null || true
+            terraform import aws_iam_role_policy.lambda_policy "${PROJECT_NAME}-lambda-role:${PROJECT_NAME}-lambda-policy" 2>/dev/null || true
+          else
+            echo "Estado do Terraform já contém recursos. Prosseguindo com destroy..."
+          fi
+
+      - name: Terraform Destroy (Manual)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.terraform_action == 'destroy'
+        run: terraform destroy -auto-approve

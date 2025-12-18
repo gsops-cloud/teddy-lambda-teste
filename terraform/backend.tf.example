@@ -1,0 +1,13 @@
+# Exemplo de configuração de backend S3
+# Para usar localmente, renomeie este arquivo para backend.tf
+# No GitHub Actions, o backend é configurado automaticamente via secrets
+
+terraform {
+  backend "s3" {
+    bucket         = "gsopscloud-terraform-teddy"
+    key            = "terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-state-lock-teddy"  # Opcional, para locking
+    encrypt        = true
+  }
+}
